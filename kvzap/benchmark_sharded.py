@@ -2,10 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Benchmark KVzap (KVzapPress + DMSPress) on a model whose decoder layers are split across several GPUs.
+Benchmark KV cache compression methods on a model whose decoder layers are split across several GPUs.
 
-For a single long context and several questions about it, four runs are measured:
-    compression {off, on} x context cache {reuse, recompute}
+For a single long context and several questions about it, every method is measured with the context cache
+either reused or recomputed:
+    method {none, kvzap, triattention} x context cache {reuse, recompute}
+
+- none: no compression
+- kvzap: DMSPress(KVzapPress), evicts the KV pairs whose KVzap score is below a threshold
+- triattention: TriAttentionPress, keeps the (1 - compression_ratio) fraction of the context KV pairs with the
+  highest TriAttention scores (https://github.com/WeianMao/triattention, needs its calibration stats)
 
 - reuse: the context is prefilled once and its KV cache is shared by all questions. After each answer the
   question and answer tokens are removed from the cache (as in KVPressTextGenerationPipeline).
@@ -21,9 +27,12 @@ Reported metrics:
 
 Note that DMSPress does not physically remove KV pairs: evicted keys are masked in the attention
 (see kvpress/attention_patch.py), so the KV cache keeps its full size and compression adds a small overhead.
+TriAttentionPress removes the pruned KV pairs from the cache, which reduces its size and the attention cost.
 
 Usage (from the repository root, on 2 x A100):
-    python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-8B --threshold -4 --num_gpus 2
+    git clone https://github.com/WeianMao/triattention.git ../triattention
+    python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-8B --num_gpus 2 --threshold -4 \
+        --triattention_stats ../triattention/triattention/calibration/for_aime25_experiment/qwen3_8b.pt
 """
 
 import json
@@ -38,7 +47,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, DynamicCache, pipeline
 
-from kvpress import DMSPress, KVzapPress
+from kvpress import BasePress, DMSPress, KVzapPress, TriAttentionPress
 from kvzap.sharding import describe_device_map, load_sharded_model, synchronize_all
 
 logger = logging.getLogger(__name__)
@@ -51,12 +60,11 @@ class QuestionStats:
     context_prefill_s: float
     decode_token_latencies_s: list[float] = field(repr=False)
     n_generated_tokens: int = 0
-    compression_ratio: float = 0.0
 
 
 @dataclass
 class RunStats:
-    compression: str
+    method: str
     mode: str
     context_tokens: int
     n_questions: int
@@ -95,8 +103,15 @@ def kv_cache_gb(cache: DynamicCache) -> float:
     return sum(layer.keys.nbytes + layer.values.nbytes for layer in cache.layers) / 1e9
 
 
+def context_compression_ratio(press: Optional[BasePress], cache: DynamicCache, context_length: int) -> float:
+    """Fraction of the context KV pairs evicted: masked for DMSPress, removed from the cache for other presses."""
+    if isinstance(press, DMSPress):
+        return press.compression_ratio
+    return 1 - sum(cache.get_seq_length(i) for i in range(len(cache))) / (len(cache) * context_length)
+
+
 @torch.inference_mode()
-def prefill_context(model, context_ids: torch.Tensor, press: Optional[DMSPress]) -> tuple[DynamicCache, float]:
+def prefill_context(model, context_ids: torch.Tensor, press: Optional[BasePress]) -> tuple[DynamicCache, float]:
     cache = DynamicCache()
     synchronize_all()
     start = time.perf_counter()
@@ -156,9 +171,10 @@ def answer_question(
 @torch.inference_mode()
 def run(
     pipe,
+    method: str,
     context_ids: torch.Tensor,
     questions_ids: list[torch.Tensor],
-    press: Optional[DMSPress],
+    press: Optional[BasePress],
     reuse: bool,
     max_new_tokens: int,
     ignore_eos: bool,
@@ -166,7 +182,7 @@ def run(
     model, tokenizer = pipe.model, pipe.tokenizer
     for device_idx in range(torch.cuda.device_count()):
         torch.cuda.reset_peak_memory_stats(device_idx)
-    decoding = press is not None and press.decoding
+    decoding = isinstance(press, DMSPress) and press.decoding
     context_length = context_ids.shape[1]
 
     question_stats, answers, context_prefill_times = [], [], []
@@ -184,7 +200,7 @@ def run(
             # context prefill to restore it before the next question, as KVPressTextGenerationPipeline does
             dms_state = pipe._save_dms_state(press, cache) if decoding else None
             cache_gb = kv_cache_gb(cache)
-            compression_ratio_context = press.compression_ratio if press is not None else 0.0
+            compression_ratio_context = context_compression_ratio(press, cache, context_length)
         elif dms_state is not None:
             pipe._restore_dms_state(press, dms_state, cache)
         cache_seq_lengths = [cache.get_seq_length(layer_idx) for layer_idx in range(len(cache))]
@@ -206,7 +222,6 @@ def run(
                 context_prefill_s=context_prefill_s,
                 decode_token_latencies_s=decode_latencies,
                 n_generated_tokens=len(decode_latencies) + 1,
-                compression_ratio=press.compression_ratio if press is not None else 0.0,
             )
         )
         answers.append(answer)
@@ -222,7 +237,7 @@ def run(
     all_decode = [t for s in question_stats for t in s.decode_token_latencies_s]
     total_tokens = sum(s.n_generated_tokens for s in question_stats)
     return RunStats(
-        compression="on" if press is not None else "off",
+        method=method,
         mode="reuse" if reuse else "recompute",
         context_tokens=context_length,
         n_questions=len(questions_ids),
@@ -246,27 +261,30 @@ def run(
 
 def print_table(results: list[RunStats]):
     header = (
-        f"{'compression':<12}{'mode':<11}{'ctx prefill s':>14}{'TTFT mean s':>13}{'TTFT q1 s':>11}"
+        f"{'method':<14}{'mode':<11}{'ctx prefill s':>14}{'TTFT mean s':>13}{'TTFT q1 s':>11}"
         f"{'decode ms/tok':>15}{'decode tok/s':>14}{'e2e tok/s':>11}{'total s':>9}{'comp. ratio':>13}"
     )
     print(header)
     print("-" * len(header))
     for r in results:
         print(
-            f"{r.compression:<12}{r.mode:<11}{r.context_prefill_s_mean:>14.3f}{r.ttft_s_mean:>13.3f}"
+            f"{r.method:<14}{r.mode:<11}{r.context_prefill_s_mean:>14.3f}{r.ttft_s_mean:>13.3f}"
             f"{r.ttft_s_first:>11.3f}{r.decode_ms_per_token:>15.2f}{r.decode_tok_per_s:>14.1f}"
             f"{r.e2e_tok_per_s:>11.1f}{r.total_wall_s:>9.2f}{r.compression_ratio_context:>13.2%}"
         )
     for r in results:
         memory = ", ".join(f"{device}: {gb:.1f} GB" for device, gb in r.peak_memory_gb.items())
-        print(f"peak memory [{r.compression}/{r.mode}]: {memory} (KV cache {r.kv_cache_gb:.2f} GB)")
+        print(f"peak memory [{r.method}/{r.mode}]: {memory} (KV cache {r.kv_cache_gb:.2f} GB)")
 
 
 def benchmark(
     model_name: str = "Qwen/Qwen3-8B",
+    methods: str | tuple[str, ...] = ("none", "kvzap", "triattention"),
     kvzap_model_type: str = "mlp",
     threshold: float = -4.0,
     decoding: bool = False,
+    triattention_stats: Optional[str] = None,
+    triattention_compression_ratio: float = 0.5,
     num_gpus: int = 2,
     context_length: int = 16000,
     n_questions: int = 4,
@@ -275,18 +293,24 @@ def benchmark(
     context_file: Optional[str] = None,
     output_file: Optional[str] = None,
 ):
-    """Benchmark compression on vs off and context cache reuse vs recompute on a layer-sharded model.
+    """Benchmark compression methods and context cache reuse vs recompute on a layer-sharded model.
 
     Parameters
     ----------
     model_name : str, optional
         HuggingFace model name, by default "Qwen/Qwen3-8B" (needs a matching nvidia/KVzap-* model)
+    methods : str or tuple of str, optional
+        Methods to compare among "none", "kvzap" and "triattention", by default all of them
     kvzap_model_type : str, optional
         KVzap surrogate model type, "mlp" or "linear", by default "mlp"
     threshold : float, optional
         DMSPress threshold on the KVzap scores, by default -4.0
     decoding : bool, optional
         Also compress the question and generated tokens (DMSPress.decoding), by default False
+    triattention_stats : str, optional
+        Path to the TriAttention calibration stats for model_name, required for "triattention"
+    triattention_compression_ratio : float, optional
+        Fraction of the context KV pairs removed by TriAttention, by default 0.5
     num_gpus : int, optional
         Number of GPUs to split the decoder layers across, by default 2
     context_length : int, optional
@@ -300,8 +324,23 @@ def benchmark(
     context_file : str, optional
         Text file used as context instead of a LooGLE document, by default None
     output_file : str, optional
-        Where to save the JSON results, by default results/benchmark_sharded__<model>__<threshold>.json
+        Where to save the JSON results, by default results/benchmark_sharded__<model>.json
     """
+    methods = methods.split(",") if isinstance(methods, str) else list(methods)
+    presses: dict[str, Optional[BasePress]] = {}
+    for method in methods:
+        if method == "none":
+            presses[method] = None
+        elif method == "kvzap":
+            presses[method] = DMSPress(KVzapPress(model_type=kvzap_model_type), threshold=threshold, decoding=decoding)
+        elif method == "triattention":
+            assert triattention_stats is not None, "--triattention_stats is required for the triattention method"
+            presses[method] = TriAttentionPress(
+                compression_ratio=triattention_compression_ratio, stats_path=triattention_stats
+            )
+        else:
+            raise ValueError(f"Unknown method {method}, expected none, kvzap or triattention")
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = load_sharded_model(model_name, num_gpus=num_gpus)
     print(f"Sharded {model_name}: {describe_device_map(model)}")
@@ -314,31 +353,30 @@ def benchmark(
     questions_ids = [q.to(model.device) for q in inputs["questions_ids"]]
     print(f"Context: {context_ids.shape[1]} tokens, {len(questions_ids)} questions, {max_new_tokens} new tokens each")
 
-    press = DMSPress(KVzapPress(model_type=kvzap_model_type), threshold=threshold, decoding=decoding)
-
-    # Warmup: loads the KVzap model and the CUDA kernels on both GPUs
-    for warmup_press in [None, press]:
-        run(pipe, context_ids[:, :1024], questions_ids[:1], warmup_press, True, 8, ignore_eos)
+    # Warmup: loads the KVzap model / TriAttention stats and the CUDA kernels on all GPUs
+    for method, press in presses.items():
+        run(pipe, method, context_ids[:, :1024], questions_ids[:1], press, True, 8, ignore_eos)
 
     results = []
-    for run_press in [None, press]:
+    for method, press in presses.items():
         for reuse in [True, False]:
-            results.append(run(pipe, context_ids, questions_ids, run_press, reuse, max_new_tokens, ignore_eos))
+            results.append(run(pipe, method, context_ids, questions_ids, press, reuse, max_new_tokens, ignore_eos))
             r = results[-1]
-            print(f"done: compression={r.compression} mode={r.mode} total={r.total_wall_s:.2f}s")
+            print(f"done: method={r.method} mode={r.mode} total={r.total_wall_s:.2f}s")
 
     print()
     print_table(results)
 
-    output_path = Path(
-        output_file or f"results/benchmark_sharded__{model_name.replace('/', '--')}__{threshold:.2f}.json"
-    )
+    output_path = Path(output_file or f"results/benchmark_sharded__{model_name.replace('/', '--')}.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     config = {
         "model_name": model_name,
+        "methods": methods,
         "kvzap_model_type": kvzap_model_type,
         "threshold": threshold,
         "decoding": decoding,
+        "triattention_stats": triattention_stats,
+        "triattention_compression_ratio": triattention_compression_ratio,
         "num_gpus": num_gpus,
         "device_map": describe_device_map(model),
         "max_new_tokens": max_new_tokens,

@@ -63,10 +63,13 @@ where `<model_type>` is the type of KVzap model to use ("mlp", "linear" or "no_p
 
 ## Multi-GPU benchmark
 
-`benchmark_sharded.py` splits the decoder layers across `--num_gpus` GPUs and measures context prefill time, TTFT, decoding speed and end-to-end throughput for compression off vs on, with the context KV cache either reused across questions or recomputed for every question:
+`benchmark_sharded.py` splits the decoder layers across `--num_gpus` GPUs and measures context prefill time, TTFT, decoding speed and end-to-end throughput, with the context KV cache either reused across questions or recomputed for every question. It compares no compression, KVzap (`DMSPress(KVzapPress)`) and [TriAttention](https://arxiv.org/abs/2604.04921) (`TriAttentionPress`), which needs the calibration statistics from the [official repository](https://github.com/WeianMao/triattention):
 
 ```bash
-python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-8B --threshold -4 --num_gpus 2 --context_length 16000 --n_questions 4
+git clone https://github.com/WeianMao/triattention.git ../triattention
+python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-8B --num_gpus 2 --context_length 16000 --n_questions 4 \
+    --threshold -4 --triattention_compression_ratio 0.5 \
+    --triattention_stats ../triattention/triattention/calibration/for_aime25_experiment/qwen3_8b.pt
 ```
 
-Add `--decoding True` to also compress the question and generated tokens. Since `DMSPress` masks evicted keys rather than removing them from the cache, compression does not reduce the KV cache size or speed up decoding.
+Use `--methods none,kvzap` to skip TriAttention, and `--decoding True` to also compress the question and generated tokens with KVzap. Since `DMSPress` masks evicted keys rather than removing them from the cache, KVzap does not reduce the KV cache size or speed up decoding, whereas `TriAttentionPress` removes the pruned KV pairs.
