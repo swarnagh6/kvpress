@@ -232,14 +232,14 @@ class KVPressTextGenerationPipeline(Pipeline):
             perform_decoding_compression = press.decoding
         # DMSPress keeps evicting question and answer tokens during decoding. Save its state after the context
         # prefill so it can be restored before the next question, once these tokens have been removed from the cache
-        dms_state = self._save_dms_state(press) if isinstance(press, DMSPress) and press.decoding else None
+        dms_state = self._save_dms_state(press, cache) if isinstance(press, DMSPress) and press.decoding else None
 
         with press(self.model) if perform_decoding_compression else contextlib.nullcontext():
             # Greedy decoding for each question
             answers = []
             for question_idx, question_ids in enumerate(input_tensors["questions_ids"]):
                 if dms_state is not None and question_idx > 0:
-                    self._restore_dms_state(press, dms_state)
+                    self._restore_dms_state(press, dms_state, cache)
                 if isinstance(press, KeyRerotationPress) or (isinstance(press, FinchPress) and press.rerotate_keys):
                     context_length = cache.get_seq_length()
 
@@ -259,18 +259,29 @@ class KVPressTextGenerationPipeline(Pipeline):
                 answers.append(answer)
         return answers
 
-    def _save_dms_state(self, press: DMSPress) -> dict:
+    def _save_dms_state(self, press: DMSPress, cache: Cache) -> dict:
         # DMSPress reassigns the masked indices and the scores buffers instead of editing them in place,
-        # so shallow copies are enough
+        # so shallow copies are enough.
+        # The attention patch overwrites the masked keys in the cache with fake keys. The context tokens still
+        # in the sliding window are not masked yet but can be while answering, so their keys are saved as well
+        # (a quantized cache is not affected: its keys are dequantized into new tensors at every step).
+        window_keys = {}
+        if not isinstance(cache, QuantizedCache):
+            for layer_idx, scores in press.scores_buffer.items():
+                window_keys[layer_idx] = cache.layers[layer_idx].keys[:, :, -scores.shape[-1] :].clone()
         return {
             "masked_key_indices": [getattr(layer.self_attn, "masked_key_indices", None) for layer in self._layers()],
             "scores_buffer": dict(press.scores_buffer),
             "compression_ratios": dict(press.compression_ratios),
+            "window_keys": window_keys,
         }
 
-    def _restore_dms_state(self, press: DMSPress, state: dict):
+    def _restore_dms_state(self, press: DMSPress, state: dict, cache: Cache):
+        """Restore the state saved by _save_dms_state, once the cache has been truncated back to the context."""
         for layer, masked_key_indices in zip(self._layers(), state["masked_key_indices"]):
             layer.self_attn.masked_key_indices = masked_key_indices
+        for layer_idx, keys in state["window_keys"].items():
+            cache.layers[layer_idx].keys[:, :, -keys.shape[2] :] = keys
         press.scores_buffer.clear()
         press.scores_buffer.update(state["scores_buffer"])
         press.compression_ratios.clear()

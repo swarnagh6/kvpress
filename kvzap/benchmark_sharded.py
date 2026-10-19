@@ -153,6 +153,7 @@ def answer_question(
     return answer, question_prefill_s, decode_latencies
 
 
+@torch.inference_mode()
 def run(
     pipe,
     context_ids: torch.Tensor,
@@ -181,11 +182,11 @@ def run(
             context_prefill_times.append(context_prefill_s)
             # With decoding=True, DMSPress also evicts question and answer tokens: save its state after the
             # context prefill to restore it before the next question, as KVPressTextGenerationPipeline does
-            dms_state = pipe._save_dms_state(press) if decoding else None
+            dms_state = pipe._save_dms_state(press, cache) if decoding else None
             cache_gb = kv_cache_gb(cache)
             compression_ratio_context = press.compression_ratio if press is not None else 0.0
         elif dms_state is not None:
-            pipe._restore_dms_state(press, dms_state)
+            pipe._restore_dms_state(press, dms_state, cache)
         cache_seq_lengths = [cache.get_seq_length(layer_idx) for layer_idx in range(len(cache))]
 
         if decoding:

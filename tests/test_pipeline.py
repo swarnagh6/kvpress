@@ -166,22 +166,23 @@ def test_pipeline_with_quantized_cache_multiple_questions(backend, kv_press_danu
 
 
 def test_pipeline_dms_decoding_multiple_questions(kv_press_unit_test_pipeline):  # noqa: F811
-    # With decoding=True, DMSPress also evicts question and answer tokens. Its state must be reset to the
-    # context before the next question, otherwise the masked indices point past the truncated cache.
-    # threshold=inf evicts every token that leaves the sliding window, so all answer tokens get masked.
-    context = "This is a test article. It was written on 2022-01-01."
-    questions = ["When was this article written?", "What is this article?"]
-    press = DMSPress(KnormPress(), threshold=float("inf"), sliding_window_size=2, decoding=True)
+    # With decoding=True, DMSPress also evicts question and answer tokens, and the context tokens of its sliding
+    # window, whose keys are overwritten by the attention patch. Its state and these keys must be restored before
+    # the next question, otherwise the masked indices point past the truncated cache or the keys are corrupted.
+    # threshold=inf evicts every token that leaves the sliding window.
+    context = "The quick brown fox jumps over the lazy dog. " * 40
+    questions = ["What jumps?", "Who is lazy?", "What color is the fox?"]
+    press = DMSPress(KnormPress(), threshold=float("inf"), sliding_window_size=8, decoding=True)
 
     cache = DynamicCache()
-    answers = kv_press_unit_test_pipeline(context, questions=questions, press=press, cache=cache, max_new_tokens=10)[
+    answers = kv_press_unit_test_pipeline(context, questions=questions, press=press, cache=cache, max_new_tokens=12)[
         "answers"
     ]
     context_length = cache.get_seq_length()
 
     for question, answer in zip(questions, answers):
         cache = DynamicCache()
-        single = kv_press_unit_test_pipeline(context, question=question, press=press, cache=cache, max_new_tokens=10)
+        single = kv_press_unit_test_pipeline(context, question=question, press=press, cache=cache, max_new_tokens=12)
         assert answer == single["answer"]
         assert cache.get_seq_length() == context_length
 
