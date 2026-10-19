@@ -9,7 +9,7 @@ import torch
 from transformers import AutoTokenizer, DynamicCache, QuantizedCache
 from transformers.utils import is_flash_attn_2_available, is_hqq_available, is_optimum_quanto_available
 
-from kvpress import ExpectedAttentionPress, KVzipPress
+from kvpress import DMSPress, ExpectedAttentionPress, KnormPress, KVzipPress
 from kvpress.pipeline import KVPressTextGenerationPipeline
 from tests.fixtures import danube_500m_model  # noqa: F401
 from tests.fixtures import kv_press_danube_pipeline  # noqa: F401
@@ -163,6 +163,27 @@ def test_pipeline_with_quantized_cache_multiple_questions(backend, kv_press_danu
     for question, answer in zip(questions, answers):
         single = kv_press_danube_pipeline(context, question=question, press=press, cache=make_cache())["answer"]
         assert answer == single
+
+
+def test_pipeline_dms_decoding_multiple_questions(kv_press_unit_test_pipeline):  # noqa: F811
+    # With decoding=True, DMSPress also evicts question and answer tokens. Its state must be reset to the
+    # context before the next question, otherwise the masked indices point past the truncated cache.
+    # threshold=inf evicts every token that leaves the sliding window, so all answer tokens get masked.
+    context = "This is a test article. It was written on 2022-01-01."
+    questions = ["When was this article written?", "What is this article?"]
+    press = DMSPress(KnormPress(), threshold=float("inf"), sliding_window_size=2, decoding=True)
+
+    cache = DynamicCache()
+    answers = kv_press_unit_test_pipeline(context, questions=questions, press=press, cache=cache, max_new_tokens=10)[
+        "answers"
+    ]
+    context_length = cache.get_seq_length()
+
+    for question, answer in zip(questions, answers):
+        cache = DynamicCache()
+        single = kv_press_unit_test_pipeline(context, question=question, press=press, cache=cache, max_new_tokens=10)
+        assert answer == single["answer"]
+        assert cache.get_seq_length() == context_length
 
 
 def test_pipeline_compresses_context(unit_test_model, caplog):  # noqa: F811

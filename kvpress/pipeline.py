@@ -230,10 +230,16 @@ class KVPressTextGenerationPipeline(Pipeline):
         perform_decoding_compression = press is not None and isinstance(press, (DecodingPress, PrefillDecodingPress))
         if isinstance(press, DMSPress):
             perform_decoding_compression = press.decoding
+        # DMSPress keeps evicting question and answer tokens during decoding. Save its state after the context
+        # prefill so it can be restored before the next question, once these tokens have been removed from the cache
+        dms_state = self._save_dms_state(press) if isinstance(press, DMSPress) and press.decoding else None
+
         with press(self.model) if perform_decoding_compression else contextlib.nullcontext():
             # Greedy decoding for each question
             answers = []
-            for question_ids in input_tensors["questions_ids"]:
+            for question_idx, question_ids in enumerate(input_tensors["questions_ids"]):
+                if dms_state is not None and question_idx > 0:
+                    self._restore_dms_state(press, dms_state)
                 if isinstance(press, KeyRerotationPress) or (isinstance(press, FinchPress) and press.rerotate_keys):
                     context_length = cache.get_seq_length()
 
@@ -252,6 +258,27 @@ class KVPressTextGenerationPipeline(Pipeline):
 
                 answers.append(answer)
         return answers
+
+    def _save_dms_state(self, press: DMSPress) -> dict:
+        # DMSPress reassigns the masked indices and the scores buffers instead of editing them in place,
+        # so shallow copies are enough
+        return {
+            "masked_key_indices": [getattr(layer.self_attn, "masked_key_indices", None) for layer in self._layers()],
+            "scores_buffer": dict(press.scores_buffer),
+            "compression_ratios": dict(press.compression_ratios),
+        }
+
+    def _restore_dms_state(self, press: DMSPress, state: dict):
+        for layer, masked_key_indices in zip(self._layers(), state["masked_key_indices"]):
+            layer.self_attn.masked_key_indices = masked_key_indices
+        press.scores_buffer.clear()
+        press.scores_buffer.update(state["scores_buffer"])
+        press.compression_ratios.clear()
+        press.compression_ratios.update(state["compression_ratios"])
+
+    def _layers(self):
+        model = self.model.model
+        return model.language_model.layers if hasattr(model, "language_model") else model.layers
 
     def _remove_answer_from_cache(
         self, cache: Cache, cache_seq_lengths: list[int], layer_states: Optional[list[dict]] = None
