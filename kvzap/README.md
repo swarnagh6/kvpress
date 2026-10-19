@@ -59,4 +59,14 @@ We provide a specific script to evaluate KVzap on the AIME25 benchmark using `mo
 python evaluate_aime.py <model_type> --threshold <threshold> --model_name <base_model_name>
 ```
 
-where `<model_type>` is the type of KVzap model to use ("mlp", "linear" or "no_press") and `<base_model_name>` the name of the base model to use (e.g. "Qwen/Qwen3-8B").
+where `<model_type>` is the type of KVzap model to use ("mlp", "linear" or "no_press") and `<base_model_name>` the name of the base model to use (e.g. "Qwen/Qwen3-8B"). Add `--num_gpus 2` to split the decoder layers of the base model across 2 GPUs.
+
+## Multi-GPU benchmark
+
+`benchmark_sharded.py` splits the decoder layers across `--num_gpus` GPUs and measures context prefill time, TTFT, decoding speed and end-to-end throughput for compression off vs on, with the context KV cache either reused across questions or recomputed for every question:
+
+```bash
+python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-8B --threshold -4 --num_gpus 2 --context_length 16000 --n_questions 4
+```
+
+Add `--decoding True` to also compress the question and generated tokens. Since `DMSPress` masks evicted keys rather than removing them from the cache, compression does not reduce the KV cache size or speed up decoding.

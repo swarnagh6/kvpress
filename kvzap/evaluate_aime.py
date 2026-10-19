@@ -11,6 +11,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kvpress import DMSPress, KVzapPress
+from kvzap.sharding import describe_device_map, load_sharded_model
 
 
 def calculate_metrics(df):
@@ -37,6 +38,7 @@ def evaluate(
     model_name: str = "Qwen/Qwen3-8B",
     device: str = "cuda:0",
     max_new_tokens: int = 32000,
+    num_gpus: int = 1,
 ):
     """Evaluate KVzap on the AIME25 benchmark using model.generate instead of the
     KVpress pipeline in order to use sampling parameters and not greedy decoding.
@@ -53,6 +55,9 @@ def evaluate(
         Device to use, by default "cuda:0"
     max_new_tokens : int, optional
         Maximum number of tokens to generate, by default 32000
+    num_gpus : int, optional
+        Number of GPUs to split the decoder layers across, by default 1. If > 1, `device` is ignored
+        and the layers are split into contiguous blocks (e.g. 2 x A100: half of the layers on each GPU)
     """
 
     # Create press
@@ -68,7 +73,11 @@ def evaluate(
 
     # Load tokenizer, model and dataset
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto").to(device)
+    if num_gpus > 1:
+        model = load_sharded_model(model_name, num_gpus=num_gpus)
+        print(f"Sharded {model_name}: {describe_device_map(model)}")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto").to(device)
     df = load_dataset("alessiodevoto/aime25", split="test").to_pandas()
 
     # Run evaluation
