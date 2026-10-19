@@ -32,6 +32,7 @@ from kvpress import (
     StreamingLLMPress,
     ThinKPress,
     TOVAPress,
+    TriAttentionPress,
 )
 from kvpress.presses.fastkvzip_press import FastKVzipGate
 from kvpress.presses.kvzap_press import KVzapConfig, KVzapModel
@@ -55,6 +56,17 @@ class TestKVzapPress(KVzapPress):
             n_modules=model.config.num_hidden_layers,
         )
         self.kvzap_model = KVzapModel(config)
+
+
+class TestTriAttentionPress(TriAttentionPress):
+    """Test version of TriAttentionPress that creates random statistics instead of loading a calibration file."""
+
+    def post_init_from_model(self, model):
+        n_layers, n_heads = model.config.num_hidden_layers, model.config.num_attention_heads
+        n_freq = model.config.hidden_size // n_heads // 2
+        self.q_mean = torch.complex(torch.randn(n_layers, n_heads, n_freq), torch.randn(n_layers, n_heads, n_freq))
+        self.q_abs_mean = self.q_mean.abs() + torch.rand(n_layers, n_heads, n_freq)
+        self.inv_freq = model.model.rotary_emb.inv_freq.float().cpu()
 
 
 class TestFastKVzipPress(FastKVzipPress):
@@ -164,6 +176,7 @@ default_presses = [
     {"cls": TestFastKVzipPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},
     {"cls": CURPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},
     {"cls": TestKVzapPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},
+    {"cls": TestTriAttentionPress, "kwargs": [{"compression_ratio": 0.2}, {"compression_ratio": 0.8}]},
     {
         "cls": CompactorPress,
         "kwargs": [
