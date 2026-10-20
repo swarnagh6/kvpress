@@ -63,13 +63,19 @@ where `<model_type>` is the type of KVzap model to use ("mlp", "linear" or "no_p
 
 ## Multi-GPU benchmark
 
-`benchmark_sharded.py` splits the decoder layers across `--num_gpus` GPUs and measures context prefill time, TTFT, decoding speed and end-to-end throughput, with the context KV cache either reused across questions or recomputed for every question. It compares no compression, KVzap (`DMSPress(KVzapPress)`) and [TriAttention](https://arxiv.org/abs/2604.04921) (`TriAttentionPress`), which needs the calibration statistics from the [official repository](https://github.com/WeianMao/triattention):
+`benchmark_sharded.py` splits the decoder layers across `--num_gpus` GPUs and measures context prefill time, TTFT, decoding speed and end-to-end throughput, with the context KV cache either reused across questions or recomputed for every question. It compares no compression, physical KVzap pruning (`KVzapPress` with an MLP surrogate) and [TriAttention](https://arxiv.org/abs/2604.04921) (`TriAttentionPress`), which needs the calibration statistics from the [official repository](https://github.com/WeianMao/triattention):
 
 ```bash
 git clone https://github.com/WeianMao/triattention.git ../triattention
 python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-8B --num_gpus 2 --context_length 16000 --n_questions 4 \
-    --threshold -4 --triattention_compression_ratio 0.5 \
+    --kvzap_compression_ratio 0.5 --triattention_compression_ratio 0.5 \
     --triattention_stats ../triattention/triattention/calibration/for_aime25_experiment/qwen3_8b.pt
 ```
 
-Use `--methods none,kvzap` to skip TriAttention, and `--decoding True` to also compress the question and generated tokens with KVzap. Since `DMSPress` masks evicted keys rather than removing them from the cache, KVzap does not reduce the KV cache size or speed up decoding, whereas `TriAttentionPress` removes the pruned KV pairs.
+Use `--methods none,kvzap` to skip TriAttention. In this benchmark, KVzap always uses its MLP surrogate to rank context KV entries and physically keeps the top-scoring entries per layer and KV head. Both methods reduce the actual cache tensors after prefill; question and generated tokens are not pruned. A compression ratio of `0.5` removes approximately half of the context KV entries, subject to integer rounding. There is no protected recent-token window in this fixed-budget policy.
+
+Use `--compression_ratios 0.25,0.5,0.75` to sweep the same physical removal budgets for both KVzap and TriAttention. Otherwise, `--kvzap_compression_ratio` and `--triattention_compression_ratio` select their individual budgets. The former benchmark flags `--threshold`, `--thresholds`, `--decoding`, and `--kvzap_model_type` have been removed: threshold-based DMS masking and the linear surrogate are not used by this benchmark. The standalone library's `DMSPress` API and the other evaluation scripts are unchanged.
+
+Quality scoring is enabled by default. Use `--quality True --divergence_tokens 32 --ignore_eos False` to score reference answers and compare dense/compressed next-token distributions at up to 32 dense continuation positions. LooGLE references are loaded automatically. JSON reports record achieved physical compression, actual KV bytes, timing, peak allocations, per-sample quality, and per-token KL/JS/NLL/agreement; plots are saved beside the JSON. New reports use schema version 3 and label KVzap as `physical_topk`. Historical masking reports are not modified and should not be combined with these runs as the same policy.
+
+The sharded loader checks cross-GPU tensor copies before loading the model. If direct copies corrupt values, it warns and stages transfers through CPU memory. Use `--cpu_staging True` to force this fallback for intermittent peer-copy failures. This avoids corrupted activations and inconsistent cache lengths, but adds transfer overhead to benchmark timings. The JSON configuration records whether CPU staging was used.
