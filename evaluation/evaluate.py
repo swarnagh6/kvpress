@@ -29,6 +29,7 @@ from kvpress import (
     ObservedAttentionPress,
     ScorerPress,
     ThinKPress,
+    TriAttentionPress,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class EvaluationConfig:
     key_channel_compression_ratio: Optional[float] = None
     head_compression_ratio: Optional[float] = None
     threshold: Optional[float] = None
+    triattention_stats: Optional[str] = None
 
     # Dataset and generation parameters
     fraction: float = 1.0
@@ -295,6 +297,11 @@ class EvaluationRunner:
             assert key_channel_compression_ratio is not None, "key_channel_compression_ratio must be set for ThinKPress"
             press.key_channel_compression_ratio = key_channel_compression_ratio
             logger.info(f"Set ThinKPress key_channel_compression_ratio to {key_channel_compression_ratio}")
+        elif isinstance(press, TriAttentionPress):
+            assert self.config.triattention_stats is not None, "triattention_stats must be set for TriAttentionPress"
+            press.stats_path = self.config.triattention_stats
+            press.compression_ratio = compression_ratio
+            logger.info(f"Set TriAttentionPress stats_path={press.stats_path}, compression_ratio={compression_ratio}")
         elif isinstance(press, DecodingPress):
             press.compression_interval = self.config.compression_interval or press.compression_interval
             press.target_size = self.config.target_size or press.target_size

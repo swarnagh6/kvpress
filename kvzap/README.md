@@ -73,3 +73,26 @@ python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-8B --num_gpus 2 --cont
 ```
 
 Use `--methods none,kvzap` to skip TriAttention, and `--decoding True` to also compress the question and generated tokens with KVzap. Since `DMSPress` masks evicted keys rather than removing them from the cache, KVzap does not reduce the KV cache size or speed up decoding, whereas `TriAttentionPress` removes the pruned KV pairs.
+
+The table also reports a quick quality check: answers are scored with the token F1 against the LooGLE reference answers (`F1 ref`), and against the answers without compression (`F1 none`, `EM none`). Add `--match_kvzap_compression True` to run TriAttention at the context compression ratio reached by KVzap, so that both methods are compared at the same compression.
+
+### Qwen3-32B
+
+KVzap provides `nvidia/KVzap-mlp-Qwen3-32B`, but TriAttention has no released calibration statistics for Qwen3-32B. `calibrate_triattention.py` computes them (single forward pass on ~32k tokens of the Nemotron pretraining sample, or `--text_file`), with the queries captured after the Qwen3 `q_norm`, right before RoPE:
+
+```bash
+python -m kvzap.calibrate_triattention --model_name Qwen/Qwen3-32B --num_gpus 2 --output_file calibration/qwen3_32b.pt
+python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-32B --num_gpus 2 --n_questions 8 \
+    --threshold -4 --triattention_stats calibration/qwen3_32b.pt --match_kvzap_compression True
+```
+
+For quality on full datasets, the evaluation CLI supports TriAttention with `--press_name triattention --triattention_stats <stats>`:
+
+```bash
+cd evaluation
+python evaluate.py --model Qwen/Qwen3-32B --dataset loogle --data_dir shortdep_qa --press_name kvzap_mlp --threshold -4
+python evaluate.py --model Qwen/Qwen3-32B --dataset loogle --data_dir shortdep_qa --press_name triattention \
+    --compression_ratio 0.5 --triattention_stats ../calibration/qwen3_32b.pt
+```
+
+`run_qwen3_32b.sh` runs all these steps (calibration, speed benchmark, and LooGLE / RULER evaluation of no compression, KVzap MLP and TriAttention at the KVzap compression ratio). Qwen3-32B in bf16 needs ~66 GB of weights: use `NUM_GPUS=2` with 80 GB GPUs and `NUM_GPUS=4` with 40 GB GPUs.
