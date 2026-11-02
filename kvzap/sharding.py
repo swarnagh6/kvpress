@@ -81,13 +81,13 @@ def layer_split_device_map(model_name: str, num_gpus: int = 2) -> dict[str, int]
 
 
 def load_sharded_model(
-    model_name: str, num_gpus: int = 2, dtype: str = "auto", cpu_staging: bool | None = None
+    model_name: str, num_gpus: int = 2, dtype: str = "auto", cpu_staging: bool | None = None, **model_kwargs
 ) -> PreTrainedModel:
     """Load a causal LM with its decoder layers split across `num_gpus` GPUs."""
     device_map = layer_split_device_map(model_name, num_gpus)
     if cpu_staging is None:
         cpu_staging = not _peer_copies_are_reliable(num_gpus)
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, device_map=device_map)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, device_map=device_map, **model_kwargs)
     if cpu_staging:
         logger.warning("Using CPU-staged GPU transfers; benchmark timings include CPU transfer overhead.")
         _enable_cpu_staging(model)

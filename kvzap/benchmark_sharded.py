@@ -518,6 +518,8 @@ def benchmark(
     match_tolerance: float = 0.02,
     plot: bool = True,
     seed: int = 0,
+    attn_implementation: Optional[str] = None,
+    local_files_only: bool = False,
 ):
     """Benchmark compression methods and context cache reuse vs recompute on a layer-sharded model.
 
@@ -573,6 +575,10 @@ def benchmark(
         Write quality/efficiency plots beside the JSON report, by default True
     seed : int, optional
         Torch random seed, by default 0
+    attn_implementation : str, optional
+        Transformers attention implementation, such as flash_attention_2
+    local_files_only : bool, optional
+        Load the base model and tokenizer only from the local cache
     """
     methods = methods.split(",") if isinstance(methods, str) else list(methods)
     methods = list(dict.fromkeys(method.strip() for method in methods))
@@ -635,8 +641,11 @@ def benchmark(
         else:
             raise ValueError(f"Unknown method {method}, expected none, kvzap or triattention")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = load_sharded_model(model_name, num_gpus=num_gpus, cpu_staging=cpu_staging)
+    model_kwargs = {"local_files_only": local_files_only}
+    if attn_implementation is not None:
+        model_kwargs["attn_implementation"] = attn_implementation
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=local_files_only)
+    model = load_sharded_model(model_name, num_gpus=num_gpus, cpu_staging=cpu_staging, **model_kwargs)
     print(f"Sharded {model_name}: {describe_device_map(model)}")
 
     # Reuse the pipeline preprocessing (chat template, context truncation) so that the inputs match evaluation
@@ -738,6 +747,8 @@ def benchmark(
         "match_kvzap_compression": match_kvzap_compression,
         "num_gpus": num_gpus,
         "cpu_staging": model.kvpress_cpu_staging,
+        "attn_implementation": model.config._attn_implementation,
+        "local_files_only": local_files_only,
         "device_map": describe_device_map(model),
         "max_new_tokens": max_new_tokens,
         "ignore_eos": ignore_eos,
@@ -791,4 +802,4 @@ def benchmark(
 if __name__ == "__main__":
     import fire
 
-    fire.Fire(benchmark)
+    fire.Fire(benchmark, serialize=lambda report: f"Completed {len(report['results'])} timed runs.")

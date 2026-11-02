@@ -125,6 +125,9 @@ def calibrate(
     num_gpus: int = 2,
     max_length: int = 32768,
     text_file: Optional[str] = None,
+    cpu_staging: Optional[bool] = None,
+    attn_implementation: Optional[str] = None,
+    local_files_only: bool = False,
 ):
     """Compute the TriAttention statistics of `model_name` and save them to `output_file`.
 
@@ -140,20 +143,31 @@ def calibrate(
         Number of calibration tokens, by default 32768 (as the official calibration)
     text_file : str, optional
         Plain text file to calibrate on, by default documents of nvidia/Nemotron-Pretraining-Dataset-sample
+    cpu_staging : bool, optional
+        Force CPU-staged cross-GPU transfers for hosts with unreliable peer copies
+    attn_implementation : str, optional
+        Transformers attention implementation, such as flash_attention_2
+    local_files_only : bool, optional
+        Load the base model and tokenizer only from the local cache
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model_kwargs = {"local_files_only": local_files_only}
+    if attn_implementation is not None:
+        model_kwargs["attn_implementation"] = attn_implementation
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=local_files_only)
     if num_gpus > 1:
-        model = load_sharded_model(model_name, num_gpus=num_gpus)
+        model = load_sharded_model(model_name, num_gpus=num_gpus, cpu_staging=cpu_staging, **model_kwargs)
         print(f"Sharded {model_name}: {describe_device_map(model)}")
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto", device_map="cuda:0").eval()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype="auto", device_map="cuda:0", **model_kwargs
+        ).eval()
 
     input_ids = load_calibration_ids(tokenizer, max_length, text_file).to(model.device)
     print(f"Calibrating on {input_ids.shape[1]} tokens")
 
     with QueryStatsCollector(model) as collector:
         # The decoder only (no lm_head): the logits of all the tokens are not needed
-        model.model(input_ids=input_ids)
+        model.model(input_ids=input_ids, use_cache=False)
 
     payload = collector.payload(
         {"model_name": model_name, "dtype": str(model.dtype).replace("torch.", ""), "text_file": text_file}

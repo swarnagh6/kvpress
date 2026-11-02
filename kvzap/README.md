@@ -96,9 +96,10 @@ For quality on full datasets, the evaluation CLI supports TriAttention with `--p
 
 ```bash
 cd evaluation
-python evaluate.py --model Qwen/Qwen3-32B --dataset loogle --data_dir shortdep_qa --press_name kvzap_mlp --threshold -4
+python evaluate.py --model Qwen/Qwen3-32B --num_gpus 2 --cpu_staging True \
+    --dataset loogle --data_dir shortdep_qa --press_name kvzap_mlp_head \
+    --compression_ratio 0.5 --max_context_length 4096 --max_new_tokens 128
 python evaluate.py --model Qwen/Qwen3-32B --dataset loogle --data_dir shortdep_qa --press_name triattention \
-    --compression_ratio 0.5 --triattention_stats ../calibration/qwen3_32b.pt
+    --num_gpus 2 --cpu_staging True --compression_ratio 0.5 --max_context_length 4096 \
+    --max_new_tokens 128 --triattention_stats ../results/qwen3_32b_stats.pt
 ```
-
-`run_qwen3_32b.sh` runs calibration, the physical-pruning benchmark, and LooGLE / RULER evaluation. Set `KVZAP_COMPRESSION_RATIO` to choose the benchmark budget. The separate evaluation CLI retains threshold-based KVzap DMS (`THRESHOLD`, default `-4`), while TriAttention uses the physical ratio measured by the benchmark; these full-dataset evaluations do not guarantee matched compression or use the same KVzap pruning policy as the benchmark. Qwen3-32B in bf16 needs ~66 GB of weights: use `NUM_GPUS=2` with 80 GB GPUs and `NUM_GPUS=4` with 40 GB GPUs.

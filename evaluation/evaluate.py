@@ -18,7 +18,7 @@ from datasets import load_dataset
 from evaluate_registry import DATASET_REGISTRY, PRESS_REGISTRY, SCORER_REGISTRY
 from fire import Fire
 from tqdm import tqdm
-from transformers import FineGrainedFP8Config, Pipeline, pipeline
+from transformers import AutoTokenizer, FineGrainedFP8Config, Pipeline, pipeline
 
 from kvpress import (
     ComposedPress,
@@ -31,6 +31,7 @@ from kvpress import (
     ThinKPress,
     TriAttentionPress,
 )
+from kvzap.sharding import load_sharded_model
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class EvaluationConfig:
     data_dir: Optional[str] = None
     model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
     device: Optional[str] = None
+    num_gpus: Optional[int] = None
+    cpu_staging: Optional[bool] = None
     press_name: str = "knorm"
     compression_ratio: float = 1.0
     key_channel_compression_ratio: Optional[float] = None
@@ -106,6 +109,16 @@ class EvaluationConfig:
         # Initialize model_kwargs if None
         if self.model_kwargs is None:
             self.model_kwargs = {}
+
+        if self.num_gpus is not None:
+            if self.num_gpus < 1:
+                raise ValueError("num_gpus must be positive")
+            if self.device is not None:
+                raise ValueError("Use either num_gpus or device, not both")
+            if "device_map" in self.model_kwargs:
+                raise ValueError("num_gpus builds its own device_map")
+        elif self.cpu_staging is not None:
+            raise ValueError("cpu_staging requires num_gpus")
 
         if self.dataset == "needle_in_haystack":
             assert self.needle_depth is not None, "needle_depth must be set for needle_in_haystack"
@@ -373,7 +386,7 @@ class EvaluationRunner:
             device = "auto" if torch.cuda.is_available() else "cpu"
             logger.info(f"No device specified, auto-detected device: {device}")
 
-        model_kwargs = self.config.model_kwargs or {}
+        model_kwargs = dict(self.config.model_kwargs or {})
 
         if self.config.fp8:
             model_kwargs["quantization_config"] = FineGrainedFP8Config()
@@ -386,8 +399,9 @@ class EvaluationRunner:
             try:
                 import flash_attn  # noqa: F401
 
-                model_kwargs["attn_implementation"] = "flash_attention_2"
-                logger.info("Flash Attention 2 detected, setting attn_implementation to 'flash_attention_2'.")
+                if not model_kwargs.get("attn_implementation"):
+                    model_kwargs["attn_implementation"] = "flash_attention_2"
+                logger.info(f"Using attention implementation: {model_kwargs['attn_implementation']}")
             except ImportError:
                 logger.info("Flash Attention 2 not available, using default attn_implementation.")
                 pass
@@ -402,7 +416,22 @@ class EvaluationRunner:
                 "trust_remote_code=True: the model repository can execute arbitrary Python code during loading."
             )
             pipeline_kwargs["trust_remote_code"] = True
-        if device == "auto":
+        if self.config.num_gpus is not None:
+            model = load_sharded_model(
+                model_name,
+                num_gpus=self.config.num_gpus,
+                cpu_staging=self.config.cpu_staging,
+                trust_remote_code=self.config.trust_remote_code,
+                **model_kwargs,
+            )
+            self.config.cpu_staging = model.kvpress_cpu_staging
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=self.config.trust_remote_code,
+                local_files_only=model_kwargs.get("local_files_only", False),
+            )
+            pipeline_kwargs = {"model": model, "tokenizer": tokenizer}
+        elif device == "auto":
             pipeline_kwargs["device_map"] = "auto"
         else:
             pipeline_kwargs["device"] = device
