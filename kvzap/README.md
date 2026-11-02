@@ -79,3 +79,26 @@ Use `--compression_ratios 0.25,0.5,0.75` to sweep the same physical removal budg
 Quality scoring is enabled by default. Use `--quality True --divergence_tokens 32 --ignore_eos False` to score reference answers and compare dense/compressed next-token distributions at up to 32 dense continuation positions. LooGLE references are loaded automatically. JSON reports record achieved physical compression, actual KV bytes, timing, peak allocations, per-sample quality, and per-token KL/JS/NLL/agreement; plots are saved beside the JSON. New reports use schema version 3 and label KVzap as `physical_topk`. Historical masking reports are not modified and should not be combined with these runs as the same policy.
 
 The sharded loader checks cross-GPU tensor copies before loading the model. If direct copies corrupt values, it warns and stages transfers through CPU memory. Use `--cpu_staging True` to force this fallback for intermittent peer-copy failures. This avoids corrupted activations and inconsistent cache lengths, but adds transfer overhead to benchmark timings. The JSON configuration records whether CPU staging was used.
+
+The table also reports reference token F1 (`F1 ref`) and agreement with the dense answers (`F1 none`, `EM none`), paired within the same context, length, repetition, and cache mode. Answers stop at the first EOS even when `--ignore_eos True` keeps generation running for timing. Add `--match_kvzap_compression True` to run each TriAttention sweep point at the physical context compression reached by the corresponding KVzap point; this overrides the separate TriAttention budget. Actual compression is recorded per run because integer rounding can vary with context length.
+
+### Qwen3-32B
+
+KVzap provides `nvidia/KVzap-mlp-Qwen3-32B`, but TriAttention has no released calibration statistics for Qwen3-32B. `calibrate_triattention.py` computes them (single forward pass on ~32k tokens of the Nemotron pretraining sample, or `--text_file`), with the queries captured after the Qwen3 `q_norm`, right before RoPE:
+
+```bash
+python -m kvzap.calibrate_triattention --model_name Qwen/Qwen3-32B --num_gpus 2 --output_file calibration/qwen3_32b.pt
+python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-32B --num_gpus 2 --n_questions 8 \
+    --kvzap_compression_ratio 0.5 --triattention_stats calibration/qwen3_32b.pt --match_kvzap_compression True
+```
+
+For quality on full datasets, the evaluation CLI supports TriAttention with `--press_name triattention --triattention_stats <stats>`:
+
+```bash
+cd evaluation
+python evaluate.py --model Qwen/Qwen3-32B --dataset loogle --data_dir shortdep_qa --press_name kvzap_mlp --threshold -4
+python evaluate.py --model Qwen/Qwen3-32B --dataset loogle --data_dir shortdep_qa --press_name triattention \
+    --compression_ratio 0.5 --triattention_stats ../calibration/qwen3_32b.pt
+```
+
+`run_qwen3_32b.sh` runs calibration, the physical-pruning benchmark, and LooGLE / RULER evaluation. Set `KVZAP_COMPRESSION_RATIO` to choose the benchmark budget. The separate evaluation CLI retains threshold-based KVzap DMS (`THRESHOLD`, default `-4`), while TriAttention uses the physical ratio measured by the benchmark; these full-dataset evaluations do not guarantee matched compression or use the same KVzap pruning policy as the benchmark. Qwen3-32B in bf16 needs ~66 GB of weights: use `NUM_GPUS=2` with 80 GB GPUs and `NUM_GPUS=4` with 40 GB GPUs.

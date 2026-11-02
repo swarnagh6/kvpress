@@ -24,6 +24,10 @@ Reported metrics:
 - decode: mean per-token latency and tokens/s for the tokens after the first one
 - end-to-end throughput: generated tokens / total wall time for all questions
 - compression ratio and peak memory per GPU
+- quality: answers are cut at the first EOS token and scored with the SQuAD token F1 against the LooGLE reference
+  answers, and against the answers without compression (same cache mode) to measure how much compression changes
+  them. These few questions about a single document give a quick sanity check: use the evaluation CLI
+  (evaluation/evaluate.py) on full datasets for quality numbers.
 
 Both KVzap and TriAttention physically remove context KV pairs after prefill using fixed-budget top-k selection.
 Question and generated tokens are not compressed. Original absolute positions are preserved during generation.
@@ -32,6 +36,12 @@ Usage (from the repository root, on 2 x A100):
     git clone https://github.com/WeianMao/triattention.git ../triattention
     python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-8B --num_gpus 2 --kvzap_compression_ratio 0.5 \
         --triattention_stats ../triattention/triattention/calibration/for_aime25_experiment/qwen3_8b.pt
+
+For Qwen/Qwen3-32B (KVzap model nvidia/KVzap-mlp-Qwen3-32B, 2 x A100 80GB), calibrate the TriAttention stats first:
+    python -m kvzap.calibrate_triattention --model_name Qwen/Qwen3-32B --num_gpus 2 \
+        --output_file calibration/qwen3_32b.pt
+    python -m kvzap.benchmark_sharded --model_name Qwen/Qwen3-32B --num_gpus 2 --kvzap_compression_ratio 0.5 \
+        --triattention_stats calibration/qwen3_32b.pt --n_questions 8
 """
 
 import json
@@ -81,6 +91,9 @@ class RunStats:
     kv_cache_gb: float
     peak_memory_gb: dict[str, float]
     answers: list[str] = field(repr=False)
+    f1_vs_reference: Optional[float] = None
+    f1_vs_none: Optional[float] = None
+    exact_match_vs_none: Optional[float] = None
     questions: list[dict] = field(default_factory=list, repr=False)
     setting: str = "default"
     context_id: str = "0"
@@ -144,7 +157,6 @@ def load_benchmark_samples(context_file, samples_file, n_questions, n_contexts):
                 "needle_depths": [None] * len(questions),
             }
         ]
-
     df = load_dataset("simonjegou/loogle", data_dir="shortdep_qa", split="test").to_pandas()
     counts = df.groupby("context")["question"].count()
     candidates = counts[counts >= n_questions]
@@ -179,6 +191,19 @@ def parse_sweep(value, default, cast=float):
     if not values or any(not torch.isfinite(torch.tensor(item)) for item in values):
         raise ValueError("Sweep values must be a nonempty list of finite numbers")
     return values
+
+
+def add_quality_metrics(results: list[RunStats], references: list[list[str]]):
+    baselines = {r.mode: r.answers for r in results if r.method == "none"}
+    for r in results:
+        reference_scores = [answer_quality(answer, refs) for answer, refs in zip(r.answers, references) if refs]
+        if reference_scores:
+            r.f1_vs_reference = mean(score["token_f1"] for score in reference_scores)
+        if r.mode in baselines:
+            r.f1_vs_none = mean(
+                answer_quality(answer, [baseline])["token_f1"] for answer, baseline in zip(r.answers, baselines[r.mode])
+            )
+            r.exact_match_vs_none = mean(float(a.strip() == b.strip()) for a, b in zip(r.answers, baselines[r.mode]))
 
 
 def kv_cache_gb(cache: DynamicCache) -> float:
@@ -247,7 +272,8 @@ def answer_question(
 ) -> tuple[str, float, list[float]]:
     """
     Greedy decoding as in KVPressTextGenerationPipeline.generate_answer, timing the question prefill
-    (which produces the first token) and every following decoding step.
+    (which produces the first token) and every following decoding step. The returned answer stops at the first
+    EOS token, even with ignore_eos.
     """
     position_ids = torch.arange(context_length, context_length + question_ids.shape[1], device=model.device)[None]
 
@@ -275,10 +301,11 @@ def answer_question(
         synchronize_all()
         decode_latencies.append(time.perf_counter() - start)
 
-    tokens = torch.stack(generated_ids)
-    answer = tokenizer.decode(tokens, skip_special_tokens=True)
+    answer_ids = torch.stack(generated_ids).cpu().tolist()
+    eos_positions = [index for index, token_id in enumerate(answer_ids) if token_id in eos_token_ids]
+    answer = tokenizer.decode(answer_ids[: eos_positions[0] if eos_positions else None], skip_special_tokens=True)
     if token_sink is not None:
-        token_sink.extend(tokens.cpu().tolist())
+        token_sink.extend(answer_ids)
     return answer, question_prefill_s, decode_latencies
 
 
@@ -439,10 +466,15 @@ def measure_quality(pipe, result, dense_result, context_ids, questions_ids, pres
     return records
 
 
+def format_score(score: Optional[float]) -> str:
+    return "-" if score is None else f"{score:.3f}"
+
+
 def print_table(results: list[RunStats]):
     header = (
         f"{'method':<14}{'mode':<11}{'ctx prefill s':>14}{'TTFT mean s':>13}{'TTFT q1 s':>11}"
         f"{'decode ms/tok':>15}{'decode tok/s':>14}{'e2e tok/s':>11}{'total s':>9}{'comp. ratio':>13}"
+        f"{'F1 ref':>8}{'F1 none':>9}{'EM none':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -453,6 +485,8 @@ def print_table(results: list[RunStats]):
             f"{r.method:<14}{r.mode:<11}{r.context_prefill_s_mean:>14.3f}{r.ttft_s_mean:>13.3f}"
             f"{r.ttft_s_first:>11.3f}{decode_ms:>15}{decode_tps:>14}"
             f"{r.e2e_tok_per_s:>11.1f}{r.total_wall_s:>9.2f}{r.compression_ratio_context:>13.2%}"
+            f"{format_score(r.f1_vs_reference):>8}{format_score(r.f1_vs_none):>9}"
+            f"{format_score(r.exact_match_vs_none):>9}"
         )
     for r in results:
         memory = ", ".join(f"{device}: {gb:.1f} GB" for device, gb in r.peak_memory_gb.items())
@@ -465,6 +499,7 @@ def benchmark(
     kvzap_compression_ratio: float = 0.5,
     triattention_stats: Optional[str] = None,
     triattention_compression_ratio: float = 0.5,
+    match_kvzap_compression: bool = False,
     num_gpus: int = 2,
     context_length: int = 16000,
     n_questions: int = 4,
@@ -489,15 +524,20 @@ def benchmark(
     Parameters
     ----------
     model_name : str, optional
-        HuggingFace model name, by default "Qwen/Qwen3-8B" (needs a matching nvidia/KVzap-* model)
+        HuggingFace model name, by default "Qwen/Qwen3-8B" (needs a matching nvidia/KVzap-* model, available for
+        Qwen/Qwen3-8B, Qwen/Qwen3-32B and meta-llama/Llama-3.1-8B-Instruct)
     methods : str or tuple of str, optional
         Methods to compare among "none", "kvzap" and "triattention", by default all of them
     kvzap_compression_ratio : float, optional
         Fraction of context KV pairs physically removed using the KVzap MLP surrogate, by default 0.5
     triattention_stats : str, optional
         Path to the TriAttention calibration stats for model_name, required for "triattention"
+        (see kvzap/calibrate_triattention.py for models without released stats, e.g. Qwen/Qwen3-32B)
     triattention_compression_ratio : float, optional
         Fraction of the context KV pairs removed by TriAttention, by default 0.5
+    match_kvzap_compression : bool, optional
+        Match each TriAttention operating point to the physical context compression reached by KVzap,
+        instead of triattention_compression_ratio, by default False
     num_gpus : int, optional
         Number of GPUs to split the decoder layers across, by default 2
     context_length : int, optional
@@ -538,7 +578,11 @@ def benchmark(
     methods = list(dict.fromkeys(method.strip() for method in methods))
     lengths = parse_sweep(context_lengths, context_length, int)
     kvzap_ratio_values = parse_sweep(compression_ratios, kvzap_compression_ratio)
-    ratio_values = parse_sweep(compression_ratios, triattention_compression_ratio)
+    ratio_values = (
+        kvzap_ratio_values.copy()
+        if match_kvzap_compression
+        else parse_sweep(compression_ratios, triattention_compression_ratio)
+    )
     if min(n_questions, n_contexts, repeats, max_new_tokens, num_gpus, *lengths) <= 0:
         raise ValueError("Context lengths, counts, max_new_tokens, and num_gpus must be positive")
     if (
@@ -549,6 +593,16 @@ def benchmark(
         raise ValueError("Need divergence_tokens >= 0, tolerance in [0, 1], compression ratios in [0, 1)")
     if samples_file and context_file:
         raise ValueError("Use either samples_file or context_file, not both")
+    if match_kvzap_compression and not {"kvzap", "triattention"}.issubset(methods):
+        raise ValueError("match_kvzap_compression needs kvzap and triattention")
+    if "triattention" in methods:
+        if not triattention_stats:
+            raise ValueError("--triattention_stats is required for the triattention method")
+        if not Path(triattention_stats).is_file():
+            raise FileNotFoundError(
+                f"TriAttention statistics not found: {triattention_stats}. Generate statistics for {model_name} "
+                "with python -m kvzap.calibrate_triattention before running the benchmark."
+            )
     if quality and "none" not in methods:
         logger.info("Adding dense baseline for paired quality evaluation")
         methods.insert(0, "none")
@@ -556,6 +610,8 @@ def benchmark(
         methods = ["none"] + [method for method in methods if method != "none"]
     if not methods:
         raise ValueError("At least one method is required")
+    if match_kvzap_compression:
+        methods = [method for method in methods if method != "triattention"] + ["triattention"]
     samples = load_benchmark_samples(context_file, samples_file, n_questions, n_contexts)
     if quality and any(not references for sample in samples for references in sample["references"]):
         logger.warning("Some questions have no references: their answer-quality scores will be unavailable, not zero")
@@ -568,7 +624,6 @@ def benchmark(
             for value in kvzap_ratio_values:
                 presses.append((method, f"ratio={value!r}", KVzapPress(model_type="mlp", compression_ratio=value)))
         elif method == "triattention":
-            assert triattention_stats is not None, "--triattention_stats is required for the triattention method"
             for value in ratio_values:
                 presses.append(
                     (
@@ -613,6 +668,12 @@ def benchmark(
                 paired_runs = []
                 dense_results = {}
                 for method, setting, press in presses:
+                    if method == "triattention" and match_kvzap_compression:
+                        press.compression_ratio = next(
+                            result.compression_ratio_context
+                            for result, _ in paired_runs
+                            if result.method == "kvzap" and result.setting == setting and result.mode == "reuse"
+                        )
                     for reuse in [True, False]:
                         result = run(pipe, method, context_ids, questions_ids, press, reuse, max_new_tokens, ignore_eos)
                         result.setting, result.context_id, result.repetition = setting, sample["id"], repetition
@@ -621,6 +682,8 @@ def benchmark(
                         if method == "none":
                             dense_results[result.mode] = result
                         print(f"done: method={method} {setting} mode={result.mode} total={result.total_wall_s:.2f}s")
+                if quality:
+                    add_quality_metrics([result for result, _ in paired_runs], sample["references"])
                 for result, press in paired_runs:
                     measured = (
                         measure_quality(
@@ -657,7 +720,6 @@ def benchmark(
                                 "quality_available": bool(sample["references"][index]) and quality,
                             }
                         )
-
     print()
     print_table(results)
 
@@ -673,6 +735,7 @@ def benchmark(
         "compression_policy": "physical_topk_prefill_only",
         "triattention_stats": triattention_stats,
         "triattention_compression_ratio": triattention_compression_ratio,
+        "match_kvzap_compression": match_kvzap_compression,
         "num_gpus": num_gpus,
         "cpu_staging": model.kvpress_cpu_staging,
         "device_map": describe_device_map(model),
