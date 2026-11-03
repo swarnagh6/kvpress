@@ -175,6 +175,10 @@ class AdaptiveKVzapPress(KVzapPress):
             device=keys.device,
             dtype=torch.long,
         )
+        empty_mask_fallback = indices.numel() == 0
+        if empty_mask_fallback:
+            # An empty layer cache breaks attention: keep the highest-scoring token instead
+            indices = torch.tensor([max(range(len(observed)), key=observed.__getitem__)], device=keys.device)
         metadata = asdict(decision)
         del metadata["keep_mask"]
         metadata.update(
@@ -185,6 +189,7 @@ class AdaptiveKVzapPress(KVzapPress):
             physical_removal_fraction=1 - len(indices) / len(observed),
             score_aggregation="mean_over_kv_heads_per_layer",
             scorer="kvzap_mlp",
+            empty_mask_fallback=empty_mask_fallback,
             reuse_bonus_applied=bool(
                 self.reuse_aware
                 and self.reuse_bonus_scale > 0

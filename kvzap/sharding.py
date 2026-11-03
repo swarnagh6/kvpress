@@ -58,7 +58,7 @@ def _enable_cpu_staging(model):
             add_hook_to_module(module, SequentialHook(_CPUStagingHook(placement_hook), placement_hook))
 
 
-def layer_split_device_map(model_name: str, num_gpus: int = 2) -> dict[str, int]:
+def layer_split_device_map(model_name: str, num_gpus: int = 2, **config_kwargs) -> dict[str, int]:
     """
     Build a device_map that splits the decoder layers into contiguous, equally sized blocks, one per GPU
     (pipeline-style sharding). The embeddings and rotary embeddings live on the first GPU, the final norm
@@ -68,7 +68,7 @@ def layer_split_device_map(model_name: str, num_gpus: int = 2) -> dict[str, int]
     layer boundaries, so every attention layer and its KV cache stay on the same device. KVzapPress moves each
     per-layer surrogate model to the device of its layer, and DMSPress keeps the masked indices on that device.
     """
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, **config_kwargs)
     num_layers = config.num_hidden_layers
     assert torch.cuda.device_count() >= num_gpus, f"Need {num_gpus} GPUs, found {torch.cuda.device_count()}"
     assert num_layers >= num_gpus, f"Cannot split {num_layers} layers across {num_gpus} GPUs"
@@ -84,7 +84,9 @@ def load_sharded_model(
     model_name: str, num_gpus: int = 2, dtype: str = "auto", cpu_staging: bool | None = None, **model_kwargs
 ) -> PreTrainedModel:
     """Load a causal LM with its decoder layers split across `num_gpus` GPUs."""
-    device_map = layer_split_device_map(model_name, num_gpus)
+    # Same cache/remote-code options as the model, so that local_files_only also covers the config lookup
+    config_kwargs = {key: model_kwargs[key] for key in ("local_files_only", "trust_remote_code") if key in model_kwargs}
+    device_map = layer_split_device_map(model_name, num_gpus, **config_kwargs)
     if cpu_staging is None:
         cpu_staging = not _peer_copies_are_reliable(num_gpus)
     model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, device_map=device_map, **model_kwargs)
