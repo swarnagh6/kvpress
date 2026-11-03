@@ -47,6 +47,7 @@ For Qwen/Qwen3-32B (KVzap model nvidia/KVzap-mlp-Qwen3-32B, 2 x A100 80GB), cali
 import json
 import logging
 import time
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import mean
@@ -98,6 +99,7 @@ class RunStats:
     setting: str = "default"
     context_id: str = "0"
     repetition: int = 0
+    policy_decisions: list[dict] = field(default_factory=list, repr=False)
 
 
 def load_benchmark_samples(context_file, samples_file, n_questions, n_contexts):
@@ -325,7 +327,7 @@ def run(
         torch.cuda.reset_peak_memory_stats(device_idx)
     context_length = context_ids.shape[1]
 
-    question_stats, answers, context_prefill_times, question_records = [], [], [], []
+    question_stats, answers, context_prefill_times, question_records, policy_decisions = [], [], [], [], []
     compression_ratio_context, cache_gb = 0.0, 0.0
     cache = None
 
@@ -340,6 +342,19 @@ def run(
             cache_gb = kv_cache_gb(cache)
             compression_ratio_context = context_compression_ratio(cache, context_length)
             token_metrics = cache_token_metrics(cache, context_length)
+            decisions = list(getattr(press, "decisions", []))
+            if decisions:
+                policy_decisions.append({"question_index": question_idx, "layers": decisions})
+                blocks = sum(decision["prefix_blocks_total"] for decision in decisions)
+                token_metrics.update(
+                    adaptive_threshold_mean=mean(decision["threshold"] for decision in decisions),
+                    adaptive_window_mean=mean(decision["window_size"] for decision in decisions),
+                    adaptive_protected_tokens_mean=mean(decision["protected_tokens"] for decision in decisions),
+                    adaptive_score_entropy_mean=mean(decision["stats"]["entropy"] for decision in decisions),
+                    adaptive_prefix_80pct_survival=(
+                        sum(decision["prefix_blocks_preserved"] for decision in decisions) / blocks if blocks else None
+                    ),
+                )
         cache_seq_lengths = [cache.get_seq_length(layer_idx) for layer_idx in range(len(cache))]
 
         generated_tokens = []
@@ -404,6 +419,7 @@ def run(
         },
         answers=answers,
         questions=question_records,
+        policy_decisions=policy_decisions,
     )
 
 
@@ -472,7 +488,7 @@ def format_score(score: Optional[float]) -> str:
 
 def print_table(results: list[RunStats]):
     header = (
-        f"{'method':<14}{'mode':<11}{'ctx prefill s':>14}{'TTFT mean s':>13}{'TTFT q1 s':>11}"
+        f"{'method':<16}{'mode':<11}{'ctx prefill s':>14}{'TTFT mean s':>13}{'TTFT q1 s':>11}"
         f"{'decode ms/tok':>15}{'decode tok/s':>14}{'e2e tok/s':>11}{'total s':>9}{'comp. ratio':>13}"
         f"{'F1 ref':>8}{'F1 none':>9}{'EM none':>9}"
     )
@@ -482,7 +498,7 @@ def print_table(results: list[RunStats]):
         decode_ms = f"{r.decode_ms_per_token:.2f}" if r.decode_ms_per_token is not None else "n/a"
         decode_tps = f"{r.decode_tok_per_s:.1f}" if r.decode_tok_per_s is not None else "n/a"
         print(
-            f"{r.method:<14}{r.mode:<11}{r.context_prefill_s_mean:>14.3f}{r.ttft_s_mean:>13.3f}"
+            f"{r.method:<16}{r.mode:<11}{r.context_prefill_s_mean:>14.3f}{r.ttft_s_mean:>13.3f}"
             f"{r.ttft_s_first:>11.3f}{decode_ms:>15}{decode_tps:>14}"
             f"{r.e2e_tok_per_s:>11.1f}{r.total_wall_s:>9.2f}{r.compression_ratio_context:>13.2%}"
             f"{format_score(r.f1_vs_reference):>8}{format_score(r.f1_vs_none):>9}"
@@ -520,6 +536,21 @@ def benchmark(
     seed: int = 0,
     attn_implementation: Optional[str] = None,
     local_files_only: bool = False,
+    adaptive_policy_root: Optional[str] = None,
+    adaptive_target_compression: Optional[float] = None,
+    adaptive_threshold: str = "adaptive",
+    adaptive_tau: float = -1.0,
+    adaptive_entropy_sensitivity: float = 0.15,
+    adaptive_task_type: str = "general",
+    adaptive_latency_budget_ms: float = 100.0,
+    adaptive_base_window: int = 128,
+    adaptive_head_tokens: int = 4,
+    adaptive_max_window: int = 512,
+    adaptive_boundary_extension: int = 64,
+    adaptive_scale_window: bool = True,
+    adaptive_score_aware_boundary: bool = True,
+    adaptive_reuse_aware: bool = True,
+    adaptive_reuse_bonus_scale: float = 0.25,
 ):
     """Benchmark compression methods and context cache reuse vs recompute on a layer-sharded model.
 
@@ -529,7 +560,7 @@ def benchmark(
         HuggingFace model name, by default "Qwen/Qwen3-8B" (needs a matching nvidia/KVzap-* model, available for
         Qwen/Qwen3-8B, Qwen/Qwen3-32B and meta-llama/Llama-3.1-8B-Instruct)
     methods : str or tuple of str, optional
-        Methods to compare among "none", "kvzap" and "triattention", by default all of them
+        Methods to compare: none, kvzap, triattention, adaptive_kvzap. The adaptive method is opt-in.
     kvzap_compression_ratio : float, optional
         Fraction of context KV pairs physically removed using the KVzap MLP surrogate, by default 0.5
     triattention_stats : str, optional
@@ -579,6 +610,23 @@ def benchmark(
         Transformers attention implementation, such as flash_attention_2
     local_files_only : bool, optional
         Load the base model and tokenizer only from the local cache
+    adaptive_policy_root : str, optional
+        Directory containing adaptive_kvpress_poc; defaults to the sibling adaptive_kvcomp_poc checkout
+    adaptive_target_compression : float, optional
+        Size factor (2 means half retained), not a guaranteed budget. Otherwise derive from KVzap ratios.
+        Cannot be combined with compression_ratios.
+    adaptive_threshold : str, optional
+        PoC threshold policy: adaptive, fixed, or percentile. Real MLP scores replace synthetic scores.
+    adaptive_tau, adaptive_entropy_sensitivity : float, optional
+        Fixed threshold and adaptive score-histogram entropy adjustment respectively
+    adaptive_task_type, adaptive_latency_budget_ms : optional
+        Workload inputs for the advisory surrogate selector; the actual scorer stays MLP
+    adaptive_base_window, adaptive_head_tokens, adaptive_max_window, adaptive_boundary_extension : int, optional
+        Protected recent window, attention sinks, tail-window cap, and score-aware extension
+    adaptive_scale_window, adaptive_score_aware_boundary : bool, optional
+        Enable compression-scaled windows and score-aware boundary protection
+    adaptive_reuse_aware, adaptive_reuse_bonus_scale : optional
+        Enable and scale log-frequency prefix bonuses using planned benchmark question requests
     """
     methods = methods.split(",") if isinstance(methods, str) else list(methods)
     methods = list(dict.fromkeys(method.strip() for method in methods))
@@ -599,6 +647,16 @@ def benchmark(
         raise ValueError("Need divergence_tokens >= 0, tolerance in [0, 1], compression ratios in [0, 1)")
     if samples_file and context_file:
         raise ValueError("Use either samples_file or context_file, not both")
+    if "adaptive_kvzap" in methods:
+        if attn_implementation not in (None, "flash_attention_2"):
+            raise ValueError("adaptive_kvzap requires flash_attention_2 for variable per-layer cache lengths")
+        attn_implementation = "flash_attention_2"
+    if adaptive_target_compression is not None and (
+        not math.isfinite(adaptive_target_compression) or adaptive_target_compression < 1
+    ):
+        raise ValueError("adaptive_target_compression must be finite and at least 1")
+    if adaptive_target_compression is not None and compression_ratios is not None:
+        raise ValueError("Use either adaptive_target_compression or compression_ratios, not both")
     if match_kvzap_compression and not {"kvzap", "triattention"}.issubset(methods):
         raise ValueError("match_kvzap_compression needs kvzap and triattention")
     if "triattention" in methods:
@@ -618,11 +676,9 @@ def benchmark(
         raise ValueError("At least one method is required")
     if match_kvzap_compression:
         methods = [method for method in methods if method != "triattention"] + ["triattention"]
-    samples = load_benchmark_samples(context_file, samples_file, n_questions, n_contexts)
-    if quality and any(not references for sample in samples for references in sample["references"]):
-        logger.warning("Some questions have no references: their answer-quality scores will be unavailable, not zero")
     torch.manual_seed(seed)
     presses = []
+    adaptive_config = None
     for method in methods:
         if method == "none":
             presses.append((method, "dense", None))
@@ -638,8 +694,53 @@ def benchmark(
                         TriAttentionPress(compression_ratio=value, stats_path=triattention_stats),
                     )
                 )
+        elif method == "adaptive_kvzap":
+            from kvzap.adaptive_policy import AdaptiveKVzapPress
+
+            adaptive_ratios = (
+                [1 - 1 / adaptive_target_compression] if adaptive_target_compression is not None else kvzap_ratio_values
+            )
+            adaptive_config = {
+                "policy_root": adaptive_policy_root,
+                "threshold_mode": adaptive_threshold,
+                "tau": adaptive_tau,
+                "entropy_sensitivity": adaptive_entropy_sensitivity,
+                "task_type": adaptive_task_type,
+                "latency_budget_ms": adaptive_latency_budget_ms,
+                "base_window": adaptive_base_window,
+                "head_tokens": adaptive_head_tokens,
+                "max_window": adaptive_max_window,
+                "boundary_extension": adaptive_boundary_extension,
+                "scale_window": adaptive_scale_window,
+                "score_aware_boundary": adaptive_score_aware_boundary,
+                "reuse_aware": adaptive_reuse_aware,
+                "reuse_bonus_scale": adaptive_reuse_bonus_scale,
+            }
+            for value in adaptive_ratios:
+                presses.append(
+                    (
+                        method,
+                        f"target={1 / (1 - value):g}x",
+                        AdaptiveKVzapPress(compression_ratio=value, **adaptive_config),
+                    )
+                )
+            adaptive_press = presses[-1][2]
+            adaptive_config = {
+                **adaptive_config,
+                "policy_root": adaptive_press.policy_root,
+                "policy_sources": adaptive_press.policy_sources,
+                "target_compression_factors": [1 / (1 - value) for value in adaptive_ratios],
+                "score_aggregation": "mean_over_kv_heads_per_layer",
+                "actual_surrogate": "mlp",
+                "tier_selection": "advisory; MLP forced for this experiment",
+                "reuse_frequency_basis": "planned question requests per context-length sweep; excludes repeats and modes",
+            }
         else:
-            raise ValueError(f"Unknown method {method}, expected none, kvzap or triattention")
+            raise ValueError(f"Unknown method {method}, expected none, kvzap, triattention or adaptive_kvzap")
+
+    samples = load_benchmark_samples(context_file, samples_file, n_questions, n_contexts)
+    if quality and any(not references for sample in samples for references in sample["references"]):
+        logger.warning("Some questions have no references: their answer-quality scores will be unavailable, not zero")
 
     model_kwargs = {"local_files_only": local_files_only}
     if attn_implementation is not None:
@@ -651,23 +752,39 @@ def benchmark(
     # Reuse the pipeline preprocessing (chat template, context truncation) so that the inputs match evaluation
     pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tokenizer)
     results, sample_records, input_manifest = [], [], []
-    warmed_up = False
+    prepared_inputs = {}
     for sample in samples:
         for length in lengths:
             inputs = pipe.preprocess(
                 sample["context"], sample["questions"], answer_prefix="", max_context_length=length
             )
-            context_ids = inputs["context_ids"].to(model.device)
-            questions_ids = [question.to(model.device) for question in inputs["questions_ids"]]
+            prepared_inputs[(sample["id"], length)] = inputs
             input_manifest.append(
                 {
                     "context_id": sample["id"],
                     "context_length_requested": length,
-                    "context_token_ids": context_ids.cpu().tolist()[0],
-                    "question_token_ids": [question.cpu().tolist()[0] for question in questions_ids],
+                    "context_token_ids": inputs["context_ids"].cpu().tolist()[0],
+                    "question_token_ids": [question.cpu().tolist()[0] for question in inputs["questions_ids"]],
                     "questions": sample["questions"],
                 }
             )
+    reuse_frequencies = {}
+    if adaptive_config is not None:
+        from kvzap.adaptive_policy import prepare_reuse_metadata
+
+        reuse_frequencies = prepare_reuse_metadata(input_manifest)
+    manifests = {(entry["context_id"], entry["context_length_requested"]): entry for entry in input_manifest}
+    warmed_up = False
+    for sample in samples:
+        for length in lengths:
+            inputs = prepared_inputs[(sample["id"], length)]
+            context_ids = inputs["context_ids"].to(model.device)
+            questions_ids = [question.to(model.device) for question in inputs["questions_ids"]]
+            if adaptive_config is not None:
+                manifest = manifests[(sample["id"], length)]
+                for method, _, press in presses:
+                    if method == "adaptive_kvzap":
+                        press.set_workload(manifest["prefix_block_hashes"], reuse_frequencies[length])
             print(f"Context {sample['id']}: {context_ids.shape[1]} tokens, {len(questions_ids)} questions")
             if not warmed_up:
                 for method, _, press in presses:
@@ -741,7 +858,8 @@ def benchmark(
         "kvzap_compression_ratio": kvzap_compression_ratio,
         "kvzap_compression_ratios": kvzap_ratio_values,
         "kvzap_pruning": "physical_topk",
-        "compression_policy": "physical_topk_prefill_only",
+        "compression_policy": "physical_mixed_prefill_only" if adaptive_config else "physical_topk_prefill_only",
+        "adaptive_policy": adaptive_config,
         "triattention_stats": triattention_stats,
         "triattention_compression_ratio": triattention_compression_ratio,
         "match_kvzap_compression": match_kvzap_compression,
@@ -768,7 +886,7 @@ def benchmark(
         "gpu_names": [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())],
     }
     report = {
-        "schema_version": 3,
+        "schema_version": 4 if adaptive_config else 3,
         "config": config,
         "inputs": input_manifest,
         "results": [asdict(result) for result in results],
@@ -780,7 +898,12 @@ def benchmark(
             "KVzap uses an MLP surrogate and physical top-k pruning; "
             "TriAttention also physically prunes context slots.",
             "Achieved and physical compression both count removed context slots; KV bytes are measured from tensors.",
-            "Compression is prefill-only, without a protected recent-token window or decoding-time eviction.",
+            "Compression is prefill-only; question and generated tokens are never pruned.",
+            "Fixed-budget KVzap/TriAttention have no protected window. Adaptive KVzap protects sinks, tail and boundary.",
+            "Adaptive KVzap uses real MLP scores averaged over KV heads per layer, not synthetic PoC profiles.",
+            "Adaptive target factors are not guaranteed budgets; compare achieved physical removal and quality.",
+            "Reuse bonuses use planned requests, not cache-mode/repeat counts; they do not implement a prefix-cache server.",
+            "PoC prefix_blocks_preserved means at least 80% retained, not an intact reusable KV block.",
             "Matched pairs match context compression, not KV bytes, peak memory, or latency budgets.",
             "Divergence uses identical dense-greedy prefixes in a separate untimed pass; units are nats.",
             "Peak memory is per timed run, shared by its question records; "
